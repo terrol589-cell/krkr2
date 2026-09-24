@@ -1,0 +1,127 @@
+name: Build KrKr2 Windows x64
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "KrKr2 commit/branch to build. Known-good Windows build: 36074994c688b8608bbfc3653f0822e07ab41bc7"
+        required: true
+        default: "36074994c688b8608bbfc3653f0822e07ab41bc7"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/.act/vcpkg
+
+    steps:
+      - name: Checkout requested KrKr2 source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 1
+
+      - name: Normalize VCPKG_ROOT
+        shell: pwsh
+        run: |
+          $normalized = "${{ github.workspace }}/.act/vcpkg" -replace '\\', '/'
+          "VCPKG_ROOT=$normalized" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install WinFlexBison, NASM and Python
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/lexxmark/winflexbison/releases/download/v2.5.25/win_flex_bison-2.5.25.zip" `
+            -OutFile "$env:TEMP\winflexbison.zip"
+
+          New-Item -ItemType Directory -Force -Path "C:\winflexbison" | Out-Null
+          Expand-Archive -Path "$env:TEMP\winflexbison.zip" -DestinationPath "C:\winflexbison" -Force
+          "C:\winflexbison" | Out-File -FilePath $env:GITHUB_PATH -Encoding ascii -Append
+
+          choco install nasm python3 -y --no-progress
+
+      - name: Cache vcpkg binary packages
+        uses: actions/cache@v5
+        with:
+          path: C:\Users\runneradmin\AppData\Local\vcpkg\archives
+          key: krkr2-vcpkg-win2022-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'vcpkg/**') }}
+          restore-keys: |
+            krkr2-vcpkg-win2022-
+
+      - name: Setup vcpkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (!(Test-Path "$env:VCPKG_ROOT")) {
+            git clone https://github.com/microsoft/vcpkg.git "$env:VCPKG_ROOT"
+          }
+
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics
+
+          if (!(Test-Path "$env:VCPKG_ROOT/vcpkg.exe")) {
+            throw "vcpkg.exe was not created"
+          }
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          cmake --version
+          ninja --version
+          python --version
+          nasm -v
+          win_bison --version
+          win_flex --version
+          & "$env:VCPKG_ROOT/vcpkg.exe" version
+
+      - name: Configure and build Release x64 with VS2022
+        shell: cmd
+        run: |
+          @echo on
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%i"
+
+          if not defined VSROOT (
+            echo ERROR: Visual Studio 2022 C++ toolchain was not found.
+            exit /b 1
+          )
+
+          call "%VSROOT%\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
+
+          where cl
+          where cmake
+          where ninja
+
+          cmake --preset="Windows Release Config" -DENABLE_TESTS=OFF -DBUILD_TOOLS=OFF
+          if errorlevel 1 exit /b 1
+
+          cmake --build --preset="Windows Release Build" --parallel
+          if errorlevel 1 exit /b 1
+
+      - name: Verify output
+        shell: pwsh
+        run: |
+          $exe = "out/windows/release/bin/krkr2/krkr2.exe"
+          if (!(Test-Path $exe)) {
+            Write-Host "Contents of output tree:"
+            Get-ChildItem "out/windows/release/bin" -Recurse -ErrorAction SilentlyContinue
+            throw "krkr2.exe was not produced"
+          }
+
+          Get-Item $exe | Format-List FullName,Length,LastWriteTime
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: krkr2-windows-x64-${{ inputs.source_ref }}
+          path: out/windows/release/bin/krkr2/**
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 6
